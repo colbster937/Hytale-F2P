@@ -10,6 +10,7 @@ const crypto = require('crypto');
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
+const JAVA_EXECUTABLE = 'java' + (process.platform === 'win32' ? '.exe' : '');
 
 function getAppDir() {
   const home = os.homedir();
@@ -28,6 +29,182 @@ const TOOLS_DIR = path.join(APP_DIR, 'butler');
 const GAME_DIR = path.join(APP_DIR, 'release', 'package', 'game', 'latest');
 const JRE_DIR = path.join(APP_DIR, 'release', 'package', 'jre', 'latest');
 const CONFIG_FILE = path.join(APP_DIR, 'config.json');
+
+function expandHome(inputPath) {
+  if (!inputPath) {
+    return inputPath;
+  }
+  if (inputPath === '~') {
+    return os.homedir();
+  }
+  if (inputPath.startsWith('~/') || inputPath.startsWith('~\\')) {
+    return path.join(os.homedir(), inputPath.slice(2));
+  }
+  return inputPath;
+}
+
+function loadConfig() {
+  try {
+    if (fs.existsSync(CONFIG_FILE)) {
+      return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    }
+  } catch (err) {
+    console.log('Notice: could not load config:', err.message);
+  }
+  return {};
+}
+
+function saveConfig(update) {
+  try {
+    createFolders();
+    const config = loadConfig();
+    const next = { ...config, ...update };
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2), 'utf8');
+  } catch (err) {
+    console.log('Notice: could not save config:', err.message);
+  }
+}
+
+async function findJavaOnPath(commandName = 'java') {
+  const lookupCmd = process.platform === 'win32' ? 'where' : 'which';
+  try {
+    const { stdout } = await execFileAsync(lookupCmd, [commandName]);
+    const line = stdout.split(/\r?\n/).map(lineItem => lineItem.trim()).find(Boolean);
+    return line || null;
+  } catch (err) {
+    return null;
+  }
+}
+
+async function getMacJavaHome() {
+  if (process.platform !== 'darwin') {
+    return null;
+  }
+  try {
+    const { stdout } = await execFileAsync('/usr/libexec/java_home');
+    const home = stdout.trim();
+    if (!home) {
+      return null;
+    }
+    return path.join(home, 'bin', JAVA_EXECUTABLE);
+  } catch (err) {
+    return null;
+  }
+}
+
+async function resolveJavaPath(inputPath) {
+  const trimmed = (inputPath || '').trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const expanded = expandHome(trimmed);
+  if (fs.existsSync(expanded)) {
+    const stat = fs.statSync(expanded);
+    if (stat.isDirectory()) {
+      const candidate = path.join(expanded, 'bin', JAVA_EXECUTABLE);
+      return fs.existsSync(candidate) ? candidate : null;
+    }
+    return expanded;
+  }
+
+  if (!path.isAbsolute(expanded)) {
+    return await findJavaOnPath(trimmed);
+  }
+
+  return null;
+}
+
+async function detectSystemJava() {
+  const envHome = process.env.JAVA_HOME;
+  if (envHome) {
+    const envJava = path.join(envHome, 'bin', JAVA_EXECUTABLE);
+    if (fs.existsSync(envJava)) {
+      return envJava;
+    }
+  }
+
+  const macJava = await getMacJavaHome();
+  if (macJava && fs.existsSync(macJava)) {
+    return macJava;
+  }
+
+  const pathJava = await findJavaOnPath('java');
+  if (pathJava && fs.existsSync(pathJava)) {
+    return pathJava;
+  }
+
+  return null;
+}
+
+async function getJavaDetection() {
+  const candidates = [];
+  const bundledJava = getBundledJavaPath() || path.join(JRE_DIR, 'bin', JAVA_EXECUTABLE);
+
+  candidates.push({
+    label: 'Bundled JRE',
+    path: bundledJava,
+    exists: fs.existsSync(bundledJava)
+  });
+
+  const javaHomeEnv = process.env.JAVA_HOME;
+  if (javaHomeEnv) {
+    const envJava = path.join(javaHomeEnv, 'bin', JAVA_EXECUTABLE);
+    candidates.push({
+      label: 'JAVA_HOME',
+      path: envJava,
+      exists: fs.existsSync(envJava),
+      note: fs.existsSync(envJava) ? '' : 'Not found'
+    });
+  } else {
+    candidates.push({
+      label: 'JAVA_HOME',
+      path: '',
+      exists: false,
+      note: 'Not set'
+    });
+  }
+
+  if (process.platform === 'darwin') {
+    const macJava = await getMacJavaHome();
+    if (macJava) {
+      candidates.push({
+        label: 'java_home',
+        path: macJava,
+        exists: fs.existsSync(macJava),
+        note: fs.existsSync(macJava) ? '' : 'Not found'
+      });
+    } else {
+      candidates.push({
+        label: 'java_home',
+        path: '',
+        exists: false,
+        note: 'Not found'
+      });
+    }
+  }
+
+  const pathJava = await findJavaOnPath('java');
+  if (pathJava) {
+    candidates.push({
+      label: 'PATH',
+      path: pathJava,
+      exists: true
+    });
+  } else {
+    candidates.push({
+      label: 'PATH',
+      path: '',
+      exists: false,
+      note: 'java not found'
+    });
+  }
+
+  return {
+    javaPath: loadJavaPath(),
+    candidates
+  };
+}
 
 function getOS() {
   if (process.platform === 'win32') return 'windows';
@@ -105,20 +282,40 @@ async function installButler() {
     return butlerPath;
   }
 
-  let url;
+  let urls = [];
   const osName = getOS();
+  const arch = getArch();
   if (osName === 'windows') {
-    url = 'https://broth.itch.zone/butler/windows-amd64/LATEST/archive/default';
+    urls = ['https://broth.itch.zone/butler/windows-amd64/LATEST/archive/default'];
   } else if (osName === 'darwin') {
-    url = 'https://broth.itch.zone/butler/darwin-amd64/LATEST/archive/default';
+    if (arch === 'arm64') {
+      urls = [
+        'https://broth.itch.zone/butler/darwin-arm64/LATEST/archive/default',
+        'https://broth.itch.zone/butler/darwin-amd64/LATEST/archive/default'
+      ];
+    } else {
+      urls = ['https://broth.itch.zone/butler/darwin-amd64/LATEST/archive/default'];
+    }
   } else if (osName === 'linux') {
-    url = 'https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default';
+    urls = ['https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default'];
   } else {
     throw new Error('Operating system not supported');
   }
 
   console.log('Fetching Butler tool...');
-  await downloadFile(url, zipPath);
+  let lastError = null;
+  for (const url of urls) {
+    try {
+      await downloadFile(url, zipPath);
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (lastError) {
+    throw lastError;
+  }
 
   console.log('Unpacking Butler...');
   const zip = new AdmZip(zipPath);
@@ -163,10 +360,9 @@ async function applyPWR(pwrFile, progressCallback) {
   const gameLatest = GAME_DIR;
   const stagingDir = path.join(gameLatest, 'staging-temp');
   
-  const gameClient = process.platform === 'win32' ? 'HytaleClient.exe' : 'HytaleClient';
-  const clientPath = path.join(gameLatest, 'Client', gameClient);
+  const clientPath = findClientPath(gameLatest);
   
-  if (fs.existsSync(clientPath)) {
+  if (clientPath) {
     console.log('Game files detected, skipping patch installation.');
     return;
   }
@@ -235,8 +431,8 @@ async function downloadJRE(progressCallback) {
   const osName = getOS();
   const arch = getArch();
 
-  const javaBin = path.join(JRE_DIR, 'bin', 'java' + (process.platform === 'win32' ? '.exe' : ''));
-  if (fs.existsSync(javaBin)) {
+  const bundledJava = getBundledJavaPath();
+  if (bundledJava) {
     console.log('Java runtime found, skipping download');
     return;
   }
@@ -294,9 +490,14 @@ async function downloadJRE(progressCallback) {
   await extractJRE(cacheFile, JRE_DIR);
 
   if (process.platform !== 'win32') {
-    const java = path.join(JRE_DIR, 'bin', 'java');
-    if (fs.existsSync(java)) {
-      fs.chmodSync(java, 0o755);
+    const javaCandidates = [
+      path.join(JRE_DIR, 'bin', JAVA_EXECUTABLE),
+      path.join(JRE_DIR, 'Contents', 'Home', 'bin', JAVA_EXECUTABLE)
+    ];
+    for (const javaPath of javaCandidates) {
+      if (fs.existsSync(javaPath)) {
+        fs.chmodSync(javaPath, 0o755);
+      }
     }
   }
 
@@ -383,31 +584,93 @@ function flattenJREDir(jreLatest) {
   }
 }
 
-function getJavaExec() {
-  const javaBin = path.join(JRE_DIR, 'bin', 'java' + (process.platform === 'win32' ? '.exe' : ''));
+function getBundledJavaPath() {
+  const candidates = [
+    path.join(JRE_DIR, 'bin', JAVA_EXECUTABLE)
+  ];
 
-  if (fs.existsSync(javaBin)) {
-    return javaBin;
+  if (process.platform === 'darwin') {
+    candidates.push(path.join(JRE_DIR, 'Contents', 'Home', 'bin', JAVA_EXECUTABLE));
+  }
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function getJavaExec() {
+  const bundledJava = getBundledJavaPath();
+  if (bundledJava) {
+    return bundledJava;
   }
 
   console.log('Notice: Java runtime not found, using system default');
   return 'java';
 }
 
-async function launchGame(playerName = 'Player', progressCallback) {
+function getClientCandidates(gameLatest) {
+  const candidates = [];
+  if (process.platform === 'win32') {
+    candidates.push(path.join(gameLatest, 'Client', 'HytaleClient.exe'));
+  } else if (process.platform === 'darwin') {
+    candidates.push(path.join(gameLatest, 'Client', 'Hytale.app', 'Contents', 'MacOS', 'HytaleClient'));
+    candidates.push(path.join(gameLatest, 'Client', 'HytaleClient'));
+  } else {
+    candidates.push(path.join(gameLatest, 'Client', 'HytaleClient'));
+  }
+  return candidates;
+}
+
+function findClientPath(gameLatest) {
+  const candidates = getClientCandidates(gameLatest);
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function launchGame(playerName = 'Player', progressCallback, javaPathOverride) {
   createFolders();
   
   saveUsername(playerName);
 
-  await downloadJRE(progressCallback);
+  const configuredJava = (javaPathOverride !== undefined && javaPathOverride !== null
+    ? javaPathOverride
+    : loadJavaPath() || '').trim();
+  let javaBin = null;
 
-  const javaBin = getJavaExec();
+  if (configuredJava) {
+    javaBin = await resolveJavaPath(configuredJava);
+    if (!javaBin) {
+      throw new Error(`Configured Java path not found: ${configuredJava}`);
+    }
+  } else {
+    try {
+      await downloadJRE(progressCallback);
+    } catch (error) {
+      const fallback = await detectSystemJava();
+      if (fallback) {
+        javaBin = fallback;
+      } else {
+        throw error;
+      }
+    }
+
+    if (!javaBin) {
+      javaBin = getJavaExec();
+    }
+  }
 
   const gameLatest = GAME_DIR;
-  const gameClient = process.platform === 'win32' ? 'HytaleClient.exe' : 'HytaleClient';
-  const clientPath = path.join(gameLatest, 'Client', gameClient);
+  let clientPath = findClientPath(gameLatest);
 
-  if (!fs.existsSync(clientPath)) {
+  if (!clientPath) {
     if (progressCallback) {
       progressCallback('Fetching game files...', null, null, null, null);
     }
@@ -416,8 +679,10 @@ async function launchGame(playerName = 'Player', progressCallback) {
     await applyPWR(pwrFile, progressCallback);
   }
 
-  if (!fs.existsSync(clientPath)) {
-    throw new Error(`Game client missing at path: ${clientPath}`);
+  clientPath = findClientPath(gameLatest);
+  if (!clientPath) {
+    const attempted = getClientCandidates(gameLatest).join(', ');
+    throw new Error(`Game client missing. Tried: ${attempted}`);
   }
 
   const uuid = uuidv4();
@@ -444,29 +709,29 @@ async function launchGame(playerName = 'Player', progressCallback) {
 }
 
 function saveUsername(username) {
-  try {
-    createFolders();
-    const config = { username: username || 'Player' };
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
-  } catch (err) {
-    console.log('Notice: could not save username:', err.message);
-  }
+  saveConfig({ username: username || 'Player' });
 }
 
 function loadUsername() {
-  try {
-    if (fs.existsSync(CONFIG_FILE)) {
-      const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-      return config.username || 'Player';
-    }
-  } catch (err) {
-    console.log('Notice: could not load username:', err.message);
-  }
-  return 'Player';
+  const config = loadConfig();
+  return config.username || 'Player';
+}
+
+function saveJavaPath(javaPath) {
+  const trimmed = (javaPath || '').trim();
+  saveConfig({ javaPath: trimmed });
+}
+
+function loadJavaPath() {
+  const config = loadConfig();
+  return config.javaPath || '';
 }
 
 module.exports = {
   launchGame,
   saveUsername,
-  loadUsername
+  loadUsername,
+  saveJavaPath,
+  loadJavaPath,
+  getJavaDetection
 };

@@ -1,6 +1,6 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
-const { launchGame, saveUsername, loadUsername } = require('./backend/launcher');
+const { launchGame, saveUsername, loadUsername, saveJavaPath, loadJavaPath } = require('./backend/launcher');
 
 let mainWindow;
 
@@ -61,7 +61,7 @@ app.on('window-all-closed', () => {
   }
 });
 
-ipcMain.handle('launch-game', async (event, playerName) => {
+ipcMain.handle('launch-game', async (event, playerName, javaPath) => {
   try {
     const progressCallback = (message, percent, speed, downloaded, total) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -76,7 +76,7 @@ ipcMain.handle('launch-game', async (event, playerName) => {
       }
     };
 
-    await launchGame(playerName, progressCallback);
+    await launchGame(playerName, progressCallback, javaPath);
     
     return { success: true };
   } catch (error) {
@@ -101,4 +101,13 @@ ipcMain.handle('save-username', (event, username) => {
 
 ipcMain.handle('load-username', () => {
   return loadUsername();
+});
+
+ipcMain.handle('save-java-path', (event, javaPath) => {
+  saveJavaPath(javaPath);
+  return { success: true };
+});
+
+ipcMain.handle('load-java-path', () => {
+  return loadJavaPath();
 });
