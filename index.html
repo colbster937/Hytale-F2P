@@ -255,6 +255,18 @@
                         >
                     </div>
 
+                    <div class="w-[28rem]">
+                        <label class="block font-mono text-xs text-gray-400 mb-2 uppercase tracking-wider">
+                            Java Path (optional)
+                        </label>
+                        <input 
+                            type="text" 
+                            id="javaPath" 
+                            class="input-field w-full rounded-lg px-4 py-3 text-white font-mono text-sm focus:outline-none"
+                            placeholder="/Library/Java/JavaVirtualMachines/.../bin/java"
+                        >
+                    </div>
+
                     <button 
                         id="playBtn"
                         onclick="launch()"
@@ -309,6 +321,7 @@
         const playBtn = document.getElementById('playBtn');
         const playText = document.getElementById('playText');
         const playerNameInput = document.getElementById('playerName');
+        const javaPathInput = document.getElementById('javaPath');
         const progressText = document.getElementById('progressText');
         const progressPercent = document.getElementById('progressPercent');
         const progressSpeed = document.getElementById('progressSpeed');
@@ -318,10 +331,16 @@
 
         async function init() {
             try {
-                const savedUsername = await window.electronAPI.loadUsername();
+                const [savedUsername, javaPath] = await Promise.all([
+                    window.electronAPI.loadUsername(),
+                    window.electronAPI.loadJavaPath()
+                ]);
                 if (savedUsername) {
                     playerNameInput.value = savedUsername;
                     username = savedUsername;
+                }
+                if (typeof javaPath === 'string') {
+                    javaPathInput.value = javaPath;
                 }
             } catch (error) {
                 console.error('Failed to load username:', error);
@@ -374,8 +393,13 @@
             }
         });
 
+        javaPathInput.addEventListener('input', async () => {
+            await window.electronAPI.saveJavaPath(javaPathInput.value.trim());
+        });
+
         async function launch() {
             const playerName = playerNameInput.value.trim() || 'Player';
+            const javaPath = javaPathInput.value.trim();
             
             await window.electronAPI.saveUsername(playerName);
             
@@ -386,7 +410,7 @@
             playText.textContent = 'PROCESSING...';
 
             try {
-                const result = await window.electronAPI.launchGame(playerName);
+                const result = await window.electronAPI.launchGame(playerName, javaPath);
                 
                 if (result.success) {
                     progressText.textContent = 'Game started!';
